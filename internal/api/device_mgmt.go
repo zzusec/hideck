@@ -1896,12 +1896,28 @@ func (s *Server) handleDeviceMgmtSetUSBNetMode(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "backend_switch": result})
 }
 
+// respondEsimWorkerUnavailable 在设备运行时实例缺失时给出可操作的错误：
+// 配置仍在说明设备离线或正在重连（503），配置已删除才是真正的设备不存在（404）。
+func (s *Server) respondEsimWorkerUnavailable(c *gin.Context, id string) {
+	if cfg, err := config.GetDeviceByID(id); err == nil && cfg != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"code":  "device_offline",
+			"error": "设备离线或正在重连，请稍后重试",
+		})
+		return
+	}
+	c.JSON(http.StatusNotFound, gin.H{
+		"code":  "device_not_found",
+		"error": "设备未找到",
+	})
+}
+
 // handleEsimListProfiles 获取 eSIM Profile 列表
 func (s *Server) handleEsimListProfiles(c *gin.Context) {
 	id := deviceIDParam(c)
 	worker := s.pool.GetWorker(id)
 	if worker == nil || worker.EsimMgr == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "设备或esim管理器未找到"})
+		s.respondEsimWorkerUnavailable(c, id)
 		return
 	}
 
@@ -2150,7 +2166,7 @@ func (s *Server) handleEsimListNotifications(c *gin.Context) {
 	id := deviceIDParam(c)
 	worker := s.pool.GetWorker(id)
 	if worker == nil || worker.EsimMgr == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "设备或esim管理器未找到"})
+		s.respondEsimWorkerUnavailable(c, id)
 		return
 	}
 	items, err := esimNotificationListExec(worker.EsimMgr.ListNotifications, strings.TrimSpace(c.Query("aid_hex")))
@@ -2169,7 +2185,7 @@ func (s *Server) handleEsimRetryNotification(c *gin.Context) {
 	id := deviceIDParam(c)
 	worker := s.pool.GetWorker(id)
 	if worker == nil || worker.EsimMgr == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "设备或esim管理器未找到"})
+		s.respondEsimWorkerUnavailable(c, id)
 		return
 	}
 	sequence, err := strconv.ParseInt(strings.TrimSpace(c.Param("sequence")), 10, 64)
@@ -2200,7 +2216,7 @@ func (s *Server) handleEsimSwitchProfile(c *gin.Context) {
 
 	worker := s.pool.GetWorker(id)
 	if worker == nil || worker.EsimMgr == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "设备或esim管理器未找到"})
+		s.respondEsimWorkerUnavailable(c, id)
 		return
 	}
 
@@ -2262,7 +2278,7 @@ func (s *Server) handleEsimDisableProfile(c *gin.Context) {
 
 	worker := s.pool.GetWorker(deviceIDParam(c))
 	if worker == nil || worker.EsimMgr == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "设备或esim管理器未找到"})
+		s.respondEsimWorkerUnavailable(c, deviceIDParam(c))
 		return
 	}
 
@@ -2304,7 +2320,7 @@ func (s *Server) handleEsimGetEID(c *gin.Context) {
 	id := deviceIDParam(c)
 	worker := s.pool.GetWorker(id)
 	if worker == nil || worker.EsimMgr == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "设备或esim管理器未找到"})
+		s.respondEsimWorkerUnavailable(c, id)
 		return
 	}
 
@@ -2325,7 +2341,7 @@ func (s *Server) handleEsimGetChipInfo(c *gin.Context) {
 	id := deviceIDParam(c)
 	worker := s.pool.GetWorker(id)
 	if worker == nil || worker.EsimMgr == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "设备或esim管理器未找到"})
+		s.respondEsimWorkerUnavailable(c, id)
 		return
 	}
 
@@ -2347,7 +2363,7 @@ func (s *Server) handleEsimGetOverview(c *gin.Context) {
 	id := deviceIDParam(c)
 	worker := s.pool.GetWorker(id)
 	if worker == nil || worker.EsimMgr == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "设备或esim管理器未找到"})
+		s.respondEsimWorkerUnavailable(c, id)
 		return
 	}
 
@@ -2400,7 +2416,7 @@ func (s *Server) handleEsimDownloadProfile(c *gin.Context) {
 	id := deviceIDParam(c)
 	worker := s.pool.GetWorker(id)
 	if worker == nil || worker.EsimMgr == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "设备或esim管理器未找到"})
+		s.respondEsimWorkerUnavailable(c, id)
 		return
 	}
 
@@ -2458,7 +2474,7 @@ func (s *Server) handleEsimRenameProfile(c *gin.Context) {
 	iccid := c.Param("iccid")
 	worker := s.pool.GetWorker(id)
 	if worker == nil || worker.EsimMgr == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "设备或esim管理器未找到"})
+		s.respondEsimWorkerUnavailable(c, id)
 		return
 	}
 
@@ -2499,7 +2515,7 @@ func (s *Server) handleEsimDeleteProfile(c *gin.Context) {
 	iccid := c.Param("iccid")
 	worker := s.pool.GetWorker(id)
 	if worker == nil || worker.EsimMgr == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "设备或esim管理器未找到"})
+		s.respondEsimWorkerUnavailable(c, id)
 		return
 	}
 
