@@ -88,10 +88,12 @@ func TestOpenProxyTransportDoesNotSpawnWhenProxyIsBusy(t *testing.T) {
 	}
 	oldDial := dialProxyHook
 	oldStart := startProxyProcessHook
+	oldKill := killProxyProcessesHook
 	oldRetryDelay := proxyRetryDelay
 	t.Cleanup(func() {
 		dialProxyHook = oldDial
 		startProxyProcessHook = oldStart
+		killProxyProcessesHook = oldKill
 		proxyRetryDelay = oldRetryDelay
 	})
 	starts := 0
@@ -102,6 +104,8 @@ func TestOpenProxyTransportDoesNotSpawnWhenProxyIsBusy(t *testing.T) {
 		starts++
 		return nil
 	}
+	// No hung proxy to reap, so the busy socket is left alone.
+	killProxyProcessesHook = func(string) int { return 0 }
 	proxyRetryDelay = time.Millisecond
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
@@ -111,6 +115,86 @@ func TestOpenProxyTransportDoesNotSpawnWhenProxyIsBusy(t *testing.T) {
 	}
 	if starts != 0 {
 		t.Fatalf("starts=%d, want 0 when the proxy socket is busy", starts)
+	}
+}
+
+// A qmi-proxy that answers dial with EAGAIN is wedged: it owns the abstract
+// socket but never accepts connections. It must be reaped and replaced, or the
+// modem stays offline forever (worker rebuild keeps failing to open QMI).
+func TestOpenProxyTransportRestartsHungProxy(t *testing.T) {
+	proxyExecutable := filepath.Join(t.TempDir(), "qmi-proxy")
+	if err := os.WriteFile(proxyExecutable, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldDial := dialProxyHook
+	oldStart := startProxyProcessHook
+	oldKill := killProxyProcessesHook
+	oldRetryDelay := proxyRetryDelay
+	oldSettle := proxyRestartSettleDelay
+	t.Cleanup(func() {
+		dialProxyHook = oldDial
+		startProxyProcessHook = oldStart
+		killProxyProcessesHook = oldKill
+		proxyRetryDelay = oldRetryDelay
+		proxyRestartSettleDelay = oldSettle
+	})
+
+	starts := 0
+	kills := 0
+	attempts := 0
+	var serverConn net.Conn
+	dialProxyHook = func(context.Context, string) (qmiTransport, error) {
+		attempts++
+		if attempts == 1 {
+			return nil, syscall.EAGAIN
+		}
+		clientConn, conn := net.Pipe()
+		serverConn = conn
+		return clientConn, nil
+	}
+	startProxyProcessHook = func(string) error {
+		starts++
+		return nil
+	}
+	killProxyProcessesHook = func(string) int {
+		kills++
+		return 1
+	}
+	proxyRetryDelay = time.Millisecond
+	proxyRestartSettleDelay = time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	conn, err := openProxyTransport(ctx, ClientOptions{ProxyExecutable: proxyExecutable})
+	if err != nil {
+		t.Fatalf("openProxyTransport() error=%v", err)
+	}
+	defer conn.Close()
+	if serverConn != nil {
+		defer serverConn.Close()
+	}
+	if kills != 1 {
+		t.Fatalf("kill attempts=%d, want 1", kills)
+	}
+	if starts != 1 {
+		t.Fatalf("start attempts=%d, want 1 after reaping the hung proxy", starts)
+	}
+}
+
+func TestIsProxyUnresponsiveError(t *testing.T) {
+	if !isProxyUnresponsiveError(syscall.EAGAIN) {
+		t.Fatal("EAGAIN should be treated as an unresponsive proxy")
+	}
+	busy := &net.OpError{Op: "dial", Net: "unix", Err: syscall.EAGAIN}
+	if !isProxyUnresponsiveError(busy) {
+		t.Fatal("wrapped EAGAIN should be treated as an unresponsive proxy")
+	}
+	if isProxyUnresponsiveError(syscall.ECONNREFUSED) {
+		t.Fatal("ECONNREFUSED means no proxy, not an unresponsive proxy")
+	}
+	if isProxyUnresponsiveError(nil) {
+		t.Fatal("nil error must not be reported as unresponsive")
 	}
 }
 

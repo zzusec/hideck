@@ -10,6 +10,8 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -19,7 +21,13 @@ import (
 var (
 	dialProxyHook         = dialProxy
 	startProxyProcessHook = startProxyProcess
-	proxyRetryDelay       = 100 * time.Millisecond
+	// killProxyProcessesHook is overridable so tests can simulate a hung proxy
+	// without touching real processes on the host.
+	killProxyProcessesHook = killProcessesByComm
+	proxyRetryDelay        = 100 * time.Millisecond
+	// proxyRestartSettleDelay gives the kernel time to release the abstract
+	// socket after a hung qmi-proxy is killed, before a replacement is spawned.
+	proxyRestartSettleDelay = 300 * time.Millisecond
 )
 
 func openProxyTransport(ctx context.Context, opts ClientOptions) (qmiTransport, error) {
@@ -50,8 +58,21 @@ func openProxyTransport(ctx context.Context, opts ClientOptions) (qmiTransport, 
 	if _, err := os.Stat(proxyExecutable); err != nil {
 		return nil, fmt.Errorf("connect qmi-proxy %q failed: %w; proxy executable %s is unavailable: %v", proxyPath, firstErr, proxyExecutable, err)
 	}
-	if shouldSpawnProxy(firstErr) {
-		if err := startProxyProcessHook(proxyExecutable); err != nil {
+
+	// A dial that fails with EAGAIN/EWOULDBLOCK means the socket exists but the
+	// running qmi-proxy is not accepting connections (listen backlog full / the
+	// process is wedged). It can never recover by itself, and spawning a second
+	// proxy cannot help because the stuck one still owns the abstract socket.
+	// Reap the hung proxy so a fresh one can take over; otherwise the modem is
+	// stuck offline forever (worker rebuild keeps failing to open QMI).
+	restarted := false
+	if isProxyUnresponsiveError(firstErr) && restartUnresponsiveProxy(proxyExecutable) {
+		restarted = true
+		waitForProxySocketRelease(ctx)
+	}
+
+	if shouldSpawnProxy(firstErr) || restarted {
+		if err := startProxyProcessHook(proxyExecutable); err != nil && !restarted {
 			return nil, fmt.Errorf("connect qmi-proxy %q failed and start %s failed: %w", proxyPath, proxyExecutable, err)
 		}
 	}
@@ -97,6 +118,87 @@ func proxySocketAddress(proxyPath string) string {
 		return "\x00" + strings.TrimPrefix(proxyPath, "@")
 	}
 	return "\x00" + proxyPath
+}
+
+// isProxyUnresponsiveError reports whether dialing the proxy failed because the
+// existing qmi-proxy process is hung rather than because no proxy is running.
+func isProxyUnresponsiveError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
+		return true
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) && (errno == syscall.EAGAIN || errno == syscall.EWOULDBLOCK) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "resource temporarily unavailable")
+}
+
+// restartUnresponsiveProxy terminates the proxy process hideck spawned plus any
+// stale qmi-proxy left behind by a previous run. Returns true when at least one
+// process was signalled.
+func restartUnresponsiveProxy(proxyExecutable string) bool {
+	killed := false
+	proxyMu.Lock()
+	cmd := liveProxyCmd
+	liveProxyCmd = nil
+	proxyMu.Unlock()
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Kill()
+		killed = true
+	}
+	name := filepath.Base(strings.TrimSpace(proxyExecutable))
+	if name == "" || name == "." || name == string(filepath.Separator) {
+		name = filepath.Base(defaultProxyExecutable)
+	}
+	if n := killProxyProcessesHook(name); n > 0 {
+		killed = true
+	}
+	return killed
+}
+
+func killProcessesByComm(name string) int {
+	if name == "" {
+		return 0
+	}
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0
+	}
+	self := os.Getpid()
+	killed := 0
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil || pid == self || pid <= 1 {
+			continue
+		}
+		comm, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "comm"))
+		if err != nil || strings.TrimSpace(string(comm)) != name {
+			continue
+		}
+		proc, err := os.FindProcess(pid)
+		if err != nil {
+			continue
+		}
+		if err := proc.Kill(); err == nil {
+			killed++
+		}
+	}
+	return killed
+}
+
+func waitForProxySocketRelease(ctx context.Context) {
+	timer := time.NewTimer(proxyRestartSettleDelay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+	case <-timer.C:
+	}
 }
 
 func shouldSpawnProxy(err error) bool {
