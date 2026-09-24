@@ -866,6 +866,34 @@ func ListIMSIsForICCID(iccid string) ([]string, error) {
 	return out, nil
 }
 
+// GetSubscriptionIMSIsForICCID 返回该 ICCID 在历史订阅（sim_subscriptions）中记录过的 IMSI。
+// sim_subscriptions 是 IMSI↔ICCID 的权威历史，不会像 sim_cards 那样被实时读取覆盖，
+// 适合用于校验实时读到的 IMSI 是否可信。
+func GetSubscriptionIMSIsForICCID(iccid string) ([]string, error) {
+	iccid = strings.TrimSpace(iccid)
+	if DB == nil || iccid == "" {
+		return nil, nil
+	}
+	var subs []SIMSubscription
+	if err := DB.Where("current_iccid IN ?", iccidLookupVariants(iccid)).Find(&subs).Error; err != nil {
+		return nil, fmt.Errorf("查询 ICCID 历史订阅 IMSI 失败: %w", err)
+	}
+	out := make([]string, 0, len(subs))
+	seen := map[string]struct{}{}
+	for _, sub := range subs {
+		imsi := strings.TrimSpace(sub.IMSI)
+		if imsi == "" {
+			continue
+		}
+		if _, ok := seen[imsi]; ok {
+			continue
+		}
+		seen[imsi] = struct{}{}
+		out = append(out, imsi)
+	}
+	return out, nil
+}
+
 func iccidLookupVariants(iccid string) []string {
 	raw := strings.TrimSpace(iccid)
 	canonical := CanonicalICCID(raw)

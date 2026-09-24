@@ -703,6 +703,14 @@ func (w *Worker) refreshIdentityLive(ctx context.Context, reason string) (liveSI
 			metadataReadOK = true
 		}
 	}
+	// 多 profile eUICC 上 QMI 可能读到非活动 AID（出厂/测试）的 IMSI，而实时 ICCID
+	// 又是正确的，导致 VoWiFi 用到错误的归属 PLMN。用该 ICCID 的历史订阅 IMSI 校验，
+	// 并用 AT 口交叉确认后再决定是否采纳。
+	if w.Backend != nil && w.Backend.Mode() == backend.BackendQMI {
+		if corrected, ok := w.reconcileLiveIMSIWithAT(ctx, iccid, imsi, reason); ok {
+			imsi = corrected
+		}
+	}
 	result := liveSIMIdentityRefreshResult{ICCID: iccid, IMSI: imsi}
 	if iccid == "" && imsi == "" && nativeSPN == "" && !hasSIMMetadata(simMetadata) {
 		return result, fmt.Errorf("live_identity_empty")
@@ -778,7 +786,10 @@ func (p *Pool) bindQMIStateIndications(worker *Worker) {
 	worker.QMICore.OnSimStatusChanged(func() {
 		logger.Info("[事件驱动] SIM 状态变化", "device", worker.ID)
 		p.handleSIMStatusEvent(worker.ID, "qmi_sim_status", nil, "")
-		p.wakeDesiredVoWiFiRecoverFromDeviceEvent(worker.ID, "post_switch_qmi_sim_status")
+		// 多 profile eUICC 在模组刚启动时可能先报非活动 AID（出厂/测试）的 IMSI，
+		// SIM 应用收敛后会再发一次状态变化，此时实时 IMSI 才是激活 profile 的归属。
+		// 先刷新身份再唤醒 VoWiFi，避免用错注册档位。
+		go p.refreshIdentityAfterSIMEvent(worker, "post_switch_qmi_sim_status")
 		go func() {
 			if err := p.applyNetworkPreference(worker); err != nil {
 				logger.Warn("SIM 状态变化后 QMI 网络偏好协调失败", "device", worker.ID, "err", err)
@@ -943,6 +954,43 @@ func (p *Pool) handleSIMStatusEvent(deviceID, source string, insertedHint *bool,
 }
 
 var deviceEventRecoverWakeDelay = 500 * time.Millisecond
+
+// refreshIdentityAfterSIMEvent 在 SIM 状态变化后刷新实时身份，并在身份确实变化时
+// 让 VoWiFi 用新身份重建会话。无论身份是否变化都会唤醒一次 VoWiFi 恢复，保持与
+// 原有事件驱动行为一致。
+func (p *Pool) refreshIdentityAfterSIMEvent(worker *Worker, wakeReason string) {
+	if p == nil || worker == nil {
+		return
+	}
+	wake := func() {
+		p.wakeDesiredVoWiFiRecoverFromDeviceEvent(worker.ID, wakeReason)
+	}
+	if p.IsESIMSwitching(worker.ID) {
+		wake()
+		return
+	}
+	before := worker.ProjectDeviceStatus()
+	if err := worker.RefreshIdentityLive(nil, "qmi_sim_status"); err != nil {
+		logger.Debug("SIM 状态变化后刷新实时身份失败", "device", worker.ID, "err", err)
+		wake()
+		return
+	}
+	p.PersistIdentityState(worker)
+	after := worker.ProjectDeviceStatus()
+	if strings.TrimSpace(after.IMSI) == strings.TrimSpace(before.IMSI) &&
+		strings.TrimSpace(after.ICCID) == strings.TrimSpace(before.ICCID) {
+		wake()
+		return
+	}
+	logger.Warn("SIM 状态变化后实时身份已更新，重建 VoWiFi 会话",
+		"device", worker.ID,
+		"old_iccid", strings.TrimSpace(before.ICCID),
+		"new_iccid", strings.TrimSpace(after.ICCID),
+		"old_imsi", strings.TrimSpace(before.IMSI),
+		"new_imsi", strings.TrimSpace(after.IMSI))
+	p.wakeDesiredVoWiFiRecoverFromDeviceEvent(worker.ID, "identity_changed_after_sim_event")
+	wake()
+}
 
 type deviceEventRecoverWakeup struct {
 	timer   *time.Timer
