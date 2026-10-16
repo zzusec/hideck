@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -287,5 +288,109 @@ func TestResolveVoWiFiCountryProxyDoesNotFailOpenPinnedRoute(t *testing.T) {
 	})
 	if err == nil || got != nil {
 		t.Fatalf("pinned missing route resolved to %+v with err=%v", got, err)
+	}
+}
+
+// 卡级前置代理解析的各分支语义：只有空值/无策略才回落国家规则；
+// direct 表示强制直连；指向不存在或已禁用的代理必须硬失败（matched=true + error），
+// 不允许静默回落——否则卡策略被禁用/删除后 VoWiFi 会悄悄改走别的出口。
+func TestResolveCardVoWiFiUpstreamProxyBranches(t *testing.T) {
+	openDeviceTestDB(t)
+	now := time.Now()
+	if err := db.UpsertUpstreamProxy(db.UpstreamProxy{
+		ID: "proxy-live", Addr: "127.0.0.1:1081", Enabled: true, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertUpstreamProxy(db.UpstreamProxy{
+		ID: "proxy-disabled", Addr: "127.0.0.1:1082", Enabled: false, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name        string
+		iccid       string
+		proxyID     string
+		seedPolicy  bool
+		wantErr     string
+		wantMatched bool
+		wantProxyID string
+	}{
+		{name: "无策略行回落", iccid: "89000000000000001001"},
+		{name: "策略为空回落", iccid: "89000000000000001002", seedPolicy: true},
+		{name: "direct 强制直连", iccid: "89000000000000001003", proxyID: db.VoWiFiUpstreamProxyDirect, seedPolicy: true, wantMatched: true},
+		{name: "代理不存在硬失败", iccid: "89000000000000001004", proxyID: "missing-node", seedPolicy: true, wantErr: "不存在", wantMatched: true},
+		{name: "代理已禁用硬失败", iccid: "89000000000000001005", proxyID: "proxy-disabled", seedPolicy: true, wantErr: "已禁用", wantMatched: true},
+		{name: "代理可用", iccid: "89000000000000001006", proxyID: "proxy-live", seedPolicy: true, wantMatched: true, wantProxyID: "proxy-live"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.seedPolicy {
+				if err := db.UpsertCardPolicy(db.CardPolicy{
+					ICCID: tc.iccid, VowifiUpstreamProxyID: tc.proxyID, Source: "user",
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cfg, matched, err := resolveCardVoWiFiUpstreamProxy(tc.iccid, "trace-1", "dev-1")
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("err=%v, want contains %q", err, tc.wantErr)
+				}
+			} else if err != nil {
+				t.Fatalf("unexpected err=%v", err)
+			}
+			if matched != tc.wantMatched {
+				t.Fatalf("matched=%v, want %v", matched, tc.wantMatched)
+			}
+			if tc.wantProxyID == "" {
+				if cfg != nil {
+					t.Fatalf("cfg=%+v, want nil", cfg)
+				}
+				return
+			}
+			if cfg == nil || cfg.ID != tc.wantProxyID || !cfg.Enabled {
+				t.Fatalf("cfg=%+v, want enabled %s", cfg, tc.wantProxyID)
+			}
+		})
+	}
+}
+
+// 卡级钉的代理被「禁用」（而非删除）时同样必须硬失败，不得回落国家规则或直连。
+func TestResolveVoWiFiCountryProxyDoesNotFailOpenDisabledPinnedRoute(t *testing.T) {
+	openDeviceTestDB(t)
+	loadDeviceCountryTableFixture(t)
+	now := time.Now()
+	if err := db.UpsertUpstreamProxy(db.UpstreamProxy{
+		ID: "country-node", Addr: "127.0.0.1:1081", Enabled: true, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertUpstreamProxy(db.UpstreamProxy{
+		ID: "pinned-disabled", Addr: "127.0.0.1:1082", Enabled: false, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertUpstreamProxyCountryRule(db.UpstreamProxyCountryRule{
+		CountryCode: "US", UpstreamProxyID: "country-node", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	iccid := "8944104444444444444"
+	if err := db.UpsertCardPolicy(db.CardPolicy{
+		ICCID: iccid, VowifiUpstreamProxyID: "pinned-disabled", Source: "user",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := resolveVoWiFiCountryProxy(voWiFiProxyResolveRequest{
+		HomeMCC: "310", TraceID: "trace-1", DeviceID: "dev-1", ICCID: iccid,
+	})
+	if err == nil || got != nil {
+		t.Fatalf("pinned disabled route resolved to %+v with err=%v", got, err)
+	}
+	if !strings.Contains(err.Error(), "已禁用") {
+		t.Fatalf("err=%v, want disabled pinned proxy error", err)
 	}
 }
